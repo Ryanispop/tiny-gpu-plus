@@ -20,6 +20,12 @@ module scheduler #(
     input wire reset,
     input wire start,
     
+    //Context switching
+    output reg active_context, // 0 or 1
+    // We need to see BOTH LSU states to make decisions
+    input reg [1:0] lsu_state_A [THREADS_PER_BLOCK-1:0],
+    input reg [1:0] lsu_state_B [THREADS_PER_BLOCK-1:0],
+
     // Control Signals
     input reg decoded_mem_read_enable,
     input reg decoded_mem_write_enable,
@@ -37,6 +43,16 @@ module scheduler #(
     output reg [2:0] core_state,
     output reg done
 );
+
+    // Storage for 2 Contexts
+    reg [7:0] pc_A, pc_B;
+    reg [2:0] state_A, state_B;
+    reg done_A, done_B;
+    
+    // Next State Logic
+    reg [2:0] next_state; 
+    reg [7:0] next_pc_val;
+
     localparam IDLE = 3'b000, // Waiting to start
         FETCH = 3'b001,       // Fetch instructions from program memory
         DECODE = 3'b010,      // Decode instructions into control signals
@@ -46,12 +62,40 @@ module scheduler #(
         UPDATE = 3'b110,      // Update registers, NZP, and PC
         DONE = 3'b111;        // Done executing this block
     
+    // --- PRIORITY LOGIC ---
+    always @(*) begin
+        // Default: Stick with current
+        // Prefer A. Only run B if A is Waiting or Done.
+        if (state_A != WAIT && state_A != DONE && state_A != IDLE) 
+            active_context = 0;
+        else if (state_A == WAIT) 
+            active_context = 1; // A is stuck, run B!
+        else if (state_A == DONE && state_B != DONE) 
+            active_context = 1;
+        else 
+            active_context = 0; // Default to A
+            
+        // Map outputs
+        if (active_context == 0) begin
+            current_pc = pc_A;
+            core_state = state_A;
+        end else begin
+            current_pc = pc_B;
+            core_state = state_B;
+        end
+        
+        done = done_A && done_B;
+    end
+
     always @(posedge clk) begin 
         if (reset) begin
-            current_pc <= 0;
-            core_state <= IDLE;
-            done <= 0;
+            pc_A <= 0; pc_B <= 0;
+            state_A <= IDLE; state_B <= IDLE;
+            done_A <= 0; done_B <= 0;
         end else begin 
+            next_state = core_state; // Default hold
+            next_pc_val = current_pc;
+
             case (core_state)
                 IDLE: begin
                     // Here after reset (before kernel is launched, or after previous block has been processed)
@@ -71,46 +115,57 @@ module scheduler #(
                     core_state <= REQUEST;
                 end
                 REQUEST: begin 
-                    // Request is synchronous so we move on after one cycle
-                    core_state <= WAIT;
+                    // If we are Context B, and Context A is WAITING, we are NOT allowed to issue a memory request, because the bus is busy.
+                     // We stall here until A finishes waiting.
+                     if (active_context == 1 && state_A == WAIT && 
+                        (decoded_mem_read_enable || decoded_mem_write_enable)) begin
+                         next_state = REQUEST; // STALL
+                     end else begin
+                         next_state = WAIT;
+                     end
                 end
                 WAIT: begin
                     // Wait for all LSUs to finish their request before continuing
-                    reg any_lsu_waiting = 1'b0;
-                    for (int i = 0; i < THREADS_PER_BLOCK; i++) begin
-                        // Make sure no lsu_state = REQUESTING or WAITING
-                        if (lsu_state[i] == 2'b01 || lsu_state[i] == 2'b10) begin
-                            any_lsu_waiting = 1'b1;
-                            break;
+                    reg any_waiting = 0;
+                    for (int i=0; i<THREADS_PER_BLOCK; i++) begin
+                        if (active_context == 0) begin
+                            if (lsu_state_A[i] == 1 || lsu_state_A[i] == 2) any_waiting = 1;
+                        end else begin
+                            if (lsu_state_B[i] == 1 || lsu_state_B[i] == 2) any_waiting = 1;
                         end
                     end
-
-                    // If no LSU is waiting for a response, move onto the next stage
-                    if (!any_lsu_waiting) begin
-                        core_state <= EXECUTE;
-                    end
+                    if (!any_waiting) next_state = EXECUTE;
                 end
                 EXECUTE: begin
                     // Execute is synchronous so we move on after one cycle
                     core_state <= UPDATE;
                 end
                 UPDATE: begin 
-                    if (decoded_ret) begin 
-                        // If we reach a RET instruction, this block is done executing
-                        done <= 1;
-                        core_state <= DONE;
-                    end else begin 
-                        // TODO: Branch divergence. For now assume all next_pc converge
-                        current_pc <= next_pc[THREADS_PER_BLOCK-1];
-
-                        // Update is synchronous so we move on after one cycle
-                        core_state <= FETCH;
+                    if (decoded_ret) begin
+                        next_state = DONE;
+                        if(active_context == 0) done_A <= 1; else done_B <= 1;
+                    end else begin
+                        next_pc_val = next_pc[THREADS_PER_BLOCK-1];
+                        next_state = FETCH;
                     end
                 end
                 DONE: begin 
                     // no-op
                 end
             endcase
+
+            if (active_context == 0) begin
+                state_A <= next_state;
+                if (core_state == UPDATE) pc_A <= next_pc_val;
+            end else begin
+                state_B <= next_state;
+                if (core_state == UPDATE) pc_B <= next_pc_val;
+            end
+            
+            // Handle Global Start (Kickoff both)
+            if (state_A == IDLE && state_B == IDLE && start) begin
+                state_A <= FETCH; state_B <= FETCH;
+            end
         end
     end
 endmodule

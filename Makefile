@@ -2,10 +2,23 @@
 
 export LIBPYTHON_LOC=$(shell cocotb-config --libpython)
 
-test_%:
-	make compile
-	iverilog -o build/sim.vvp -s gpu -g2012 build/gpu.v
-	MODULE=test.test_$* vvp -M $$(cocotb-config --prefix)/cocotb/libs -m libcocotbvpi_icarus build/sim.vvp
+test_matadd: compile
+	PYGPI_PYTHON_BIN=$(shell which python) \
+	PYTHONPATH=. \
+	COCOTB_TEST_MODULES=test.test_matadd \
+	vvp -M $(shell cocotb-config --lib-dir) -m $(shell cocotb-config --lib-name vpi icarus) build/sim.vvp
+
+test_matmul: compile
+	PYGPI_PYTHON_BIN=$(shell which python) \
+	PYTHONPATH=. \
+	COCOTB_TEST_MODULES=test.test_matmul \
+	vvp -M $(shell cocotb-config --lib-dir) -m $(shell cocotb-config --lib-name vpi icarus) build/sim.vvp
+
+test_priority: compile
+	PYGPI_PYTHON_BIN=$(shell which python) \
+	PYTHONPATH=. \
+	COCOTB_TEST_MODULES=test.test_priority \
+	vvp -M $(shell cocotb-config --lib-dir) -m $(shell cocotb-config --lib-name vpi icarus) build/sim.vvp
 
 compile:
 	make compile_alu
@@ -23,3 +36,4 @@ compile_%:
 
 show_%: %.vcd %.gtkw
 	gtkwave $^
+

@@ -1,0 +1,18 @@
+{
+  "verilog.linting.linter": "verilator",
+  "verilog.linting.enabled": true,
+
+  "verilog.linting.verilator.arguments": [
+    "--lint-only",
+    "--Wall",
+    "--Wno-DECLFILENAME",
+    "--Wno-UNUSED",
+    "-I",
+    "src"
+  ],
+
+  "verilog.includeIndexing": [
+    "src/**/*.sv",
+    "src/**/*.v"
+  ]
+}
