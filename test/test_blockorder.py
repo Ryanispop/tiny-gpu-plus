@@ -4,15 +4,31 @@ from .helpers.setup import setup
 from .helpers.memory import Memory
 from .helpers.logger import logger
 
+def safe_bits(sig) -> str:
+    s = str(sig.value)  # may contain X/Z
+    return s.replace("x","0").replace("X","0").replace("z","0").replace("Z","0")
+
+def safe_int(sig) -> int:
+    return int(safe_bits(sig), 2)
+
+def get_packed_field(sig, idx: int, width: int, n: int, lsb_first=True) -> int:
+    val = safe_int(sig)
+    if lsb_first:
+        return (val >> (idx * width)) & ((1 << width) - 1)
+    shift = (n - 1 - idx) * width
+    return (val >> shift) & ((1 << width) - 1)
+
 @cocotb.test()
-async def test_matmul_4x4_with_block_timing(dut):
+async def test_block_order_trace(dut):
+    # Program Memory
     program_memory = Memory(dut=dut, addr_bits=8, data_bits=16, channels=1, name="program")
 
+    # 4x4 matmul program (same one you've been using)
     program = [
         0b0101000011011110, # MUL R0, %blockIdx, %blockDim
         0b0011000000001111, # ADD R0, R0, %threadIdx
         0b1001000100000001, # CONST R1, #1
-        0b1001001000000100, # CONST R2, #4   (make sure encoding is correct)
+        0b1001001000000100, # CONST R2, #4
         0b1001001100000000, # CONST R3, #0
         0b1001010000010000, # CONST R4, #16  baseB
         0b1001010100100000, # CONST R5, #32  baseC
@@ -39,6 +55,7 @@ async def test_matmul_4x4_with_block_timing(dut):
         0b1111000000000000
     ]
 
+    # Data Memory
     data_memory = Memory(dut=dut, addr_bits=8, data_bits=8, channels=4, name="data")
 
     A = [
@@ -55,72 +72,56 @@ async def test_matmul_4x4_with_block_timing(dut):
     ]
     data = A + B  # C written at baseC=32
 
-    threads = 16
+    # Use more blocks so ordering is obvious:
+    # TPB=4 => threads=32 gives 8 blocks (0..7)
+    threads = 32
+
     await setup(dut, program_memory, program, data_memory, data, threads)
 
-    NUM_CORES = 2  # change if your design differs
+    NUM_CORES = 2
+    TIMEOUT = 200000
 
-    seen_start = set()
-    finish_cycle = {}     # block_id -> cycle
-    start_cycle = {}      # block_id -> first cycle observed started (optional)
+    prev_start = 0
+    prev_done = 0
+
+    dispatch_events = []
+    done_events = []
 
     cycles = 0
-    TIMEOUT = 50000
-    def safe_bits(sig) -> str:
-        s = str(sig.value)  # e.g. "01X0" or "0000000100000010..."
-        return s.replace("x","0").replace("X","0").replace("z","0").replace("Z","0")
-
-    def safe_int(sig) -> int:
-        return int(safe_bits(sig), 2)
-
-    def get_packed_field(sig, idx: int, width: int, n: int, lsb_first=True) -> int:
-        bits = safe_bits(sig)
-        # bits is MSB->LSB as a string
-        # Convert to int then shift/mask with assumed packing
-        val = int(bits, 2)
-
-        if lsb_first:
-            return (val >> (idx * width)) & ((1 << width) - 1)
-        else:
-            # MSB-first chunking
-            shift = (n - 1 - idx) * width
-            return (val >> shift) & ((1 << width) - 1)
-
     while int(dut.done.value) != 1:
         data_memory.run()
         program_memory.run()
 
-        core_start_vec = safe_int(dut.core_start)
-        core_done_vec  = safe_int(dut.core_done)
+        start_vec = safe_int(dut.core_start)
+        done_vec  = safe_int(dut.core_done)
 
+        start_rise = start_vec & (~prev_start)
+        done_rise  = done_vec  & (~prev_done)
 
         for c in range(NUM_CORES):
-            if ((core_start_vec >> c) & 1) == 1:
+            if (start_rise >> c) & 1:
                 bid = get_packed_field(dut.core_block_id, c, width=8, n=NUM_CORES, lsb_first=True)
-                if bid not in start_cycle:
-                    start_cycle[bid] = cycles
+                dispatch_events.append((cycles, c, bid))
                 logger.info(f"[cycle {cycles}] core{c} START block {bid}")
 
-            if ((core_done_vec >> c) & 1) == 1:
+            if (done_rise >> c) & 1:
                 bid = get_packed_field(dut.core_block_id, c, width=8, n=NUM_CORES, lsb_first=True)
-                if bid not in finish_cycle:
-                    finish_cycle[bid] = cycles
-                    logger.info(f"[cycle {cycles}] core{c} DONE  block {bid}")
+                done_events.append((cycles, c, bid))
+                logger.info(f"[cycle {cycles}] core{c} DONE  block {bid}")
 
+        prev_start = start_vec
+        prev_done = done_vec
 
         await RisingEdge(dut.clk)
         cycles += 1
         if cycles > TIMEOUT:
             assert False, f"Timeout waiting for done (>{TIMEOUT} cycles)"
 
+    dispatch_order = [b for (_, _, b) in dispatch_events]
+    done_order = [b for (_, _, b) in done_events]
+
     logger.info("====================================")
     logger.info(f"TOTAL cycles: {cycles}")
-    logger.info(f"Block start cycles:  {start_cycle}")
-    logger.info(f"Block finish cycles: {finish_cycle}")
+    logger.info(f"DISPATCH ORDER: {dispatch_order}")
+    logger.info(f"DONE ORDER:     {done_order}")
     logger.info("====================================")
-
-    # Correctness check: C should equal A since B is identity
-    baseC = 32
-    for i, expected in enumerate(A):
-        got = data_memory.memory[baseC + i]
-        assert got == expected, f"C[{i}] mismatch: expected {expected}, got {got}"

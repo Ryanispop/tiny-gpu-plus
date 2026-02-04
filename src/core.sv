@@ -44,20 +44,13 @@ module core #(
     reg [2:0] fetcher_state;
     reg [15:0] instruction;
 
-    // --- NEW: SHADOW STATE SIGNALS (For Priority Scheduler) ---
-    // We need separate arrays for Context A and Context B states
-    wire [7:0] next_pc_A [THREADS_PER_BLOCK-1:0];
-    wire [7:0] next_pc_B [THREADS_PER_BLOCK-1:0];
-    wire [1:0] lsu_state_A [THREADS_PER_BLOCK-1:0];
-    wire [1:0] lsu_state_B [THREADS_PER_BLOCK-1:0];
-    wire [7:0] lsu_out_A [THREADS_PER_BLOCK-1:0];
-    wire [7:0] lsu_out_B [THREADS_PER_BLOCK-1:0];
-
     // Intermediate Signals
     reg [7:0] current_pc;
-    // Note: next_pc is now handled via the muxed signals below
+    wire [7:0] next_pc[THREADS_PER_BLOCK-1:0];
     reg [7:0] rs[THREADS_PER_BLOCK-1:0];
     reg [7:0] rt[THREADS_PER_BLOCK-1:0];
+    reg [1:0] lsu_state[THREADS_PER_BLOCK-1:0];
+    reg [7:0] lsu_out[THREADS_PER_BLOCK-1:0];
     wire [7:0] alu_out[THREADS_PER_BLOCK-1:0];
     
     // Decoded Instruction Signals
@@ -77,8 +70,6 @@ module core #(
     reg decoded_alu_output_mux;             // Select operation in ALU
     reg decoded_pc_mux;                     // Select source of next PC
     reg decoded_ret;
-
-    
 
     // Fetcher
     fetcher #(
@@ -119,10 +110,9 @@ module core #(
         .decoded_ret(decoded_ret)
     );
 
-    wire [7:0] next_pc_muxed_wire [THREADS_PER_BLOCK-1:0];
-
+    // Scheduler
     scheduler #(
-        .THREADS_PER_BLOCK(THREADS_PER_BLOCK)
+        .THREADS_PER_BLOCK(THREADS_PER_BLOCK),
     ) scheduler_instance (
         .clk(clk),
         .reset(reset),
@@ -132,13 +122,9 @@ module core #(
         .decoded_mem_read_enable(decoded_mem_read_enable),
         .decoded_mem_write_enable(decoded_mem_write_enable),
         .decoded_ret(decoded_ret),
-        
-        // NEW CONNECTIONS
-        .lsu_state_A(lsu_state_A), // Pass array A
-        .lsu_state_B(lsu_state_B), // Pass array B
-        .next_pc(next_pc_muxed_wire), // Pass the MUXED next_pc
-        
+        .lsu_state(lsu_state),
         .current_pc(current_pc),
+        .next_pc(next_pc),
         .done(done)
     );
 
@@ -146,39 +132,6 @@ module core #(
     genvar i;
     generate
         for (i = 0; i < THREADS_PER_BLOCK; i = i + 1) begin : threads
-            
-            // ---------------------------------------------------------
-            // MUX LOGIC: ROUTE SIGNALS BASED ON ACTIVE CONTEXT
-            // ---------------------------------------------------------
-            // The ALU and Register File need to know Who is running?
-            // Temporary wires that carry the signals for the Active Block.
-            reg [7:0] next_pc_muxed;
-            reg [7:0] lsu_out_muxed;
-
-            always @(*) begin
-                if (scheduler_instance.active_context == 0) begin
-                    next_pc_muxed = next_pc_A[i];
-                    lsu_out_muxed = lsu_out_A[i];
-                    
-                    // Route LSU A to Memory Controller
-                    data_mem_read_valid[i]   = lsu_read_valid_A[i];
-                    data_mem_read_address[i] = lsu_read_address_A[i];
-                    data_mem_write_valid[i]  = lsu_write_valid_A[i];
-                    data_mem_write_address[i]= lsu_write_address_A[i];
-                    data_mem_write_data[i]   = lsu_write_data_A[i];
-                end else begin
-                    next_pc_muxed = next_pc_B[i];
-                    lsu_out_muxed = lsu_out_B[i];
-
-                    // Route LSU B to Memory Controller
-                    data_mem_read_valid[i]   = lsu_read_valid_B[i];
-                    data_mem_read_address[i] = lsu_read_address_B[i];
-                    data_mem_write_valid[i]  = lsu_write_valid_B[i];
-                    data_mem_write_address[i]= lsu_write_address_B[i];
-                    data_mem_write_data[i]   = lsu_write_data_B[i];
-                end
-            end
-            
             // ALU
             alu alu_instance (
                 .clk(clk),
@@ -192,74 +145,37 @@ module core #(
                 .alu_out(alu_out[i])
             );
 
-            // ---------------------------------------------------------
-            // DUAL LSUs due to conext switching
-            // ---------------------------------------------------------
-            // Intermediate wires to hold outputs from LSU A
-            wire lsu_read_valid_A, lsu_write_valid_A;
-            wire [7:0] lsu_read_address_A, lsu_write_address_A, lsu_write_data_A;
-
-            lsu lsu_instance_A (
+            // LSU
+            lsu lsu_instance (
                 .clk(clk),
                 .reset(reset),
                 .enable(i < thread_count),
-                // Only active if scheduler says Context 0
-                .core_state( (scheduler_instance.active_context == 0) ? core_state : 3'b000 ),
+                .core_state(core_state),
                 .decoded_mem_read_enable(decoded_mem_read_enable),
                 .decoded_mem_write_enable(decoded_mem_write_enable),
-                .mem_read_valid(lsu_read_valid_A),
-                .mem_read_address(lsu_read_address_A),
-                .mem_read_ready(data_mem_read_ready[i]), // Shared Ready
-                .mem_read_data(data_mem_read_data[i]),   // Shared Data
-                .mem_write_valid(lsu_write_valid_A),
-                .mem_write_address(lsu_write_address_A),
-                .mem_write_data(lsu_write_data_A),
+                .mem_read_valid(data_mem_read_valid[i]),
+                .mem_read_address(data_mem_read_address[i]),
+                .mem_read_ready(data_mem_read_ready[i]),
+                .mem_read_data(data_mem_read_data[i]),
+                .mem_write_valid(data_mem_write_valid[i]),
+                .mem_write_address(data_mem_write_address[i]),
+                .mem_write_data(data_mem_write_data[i]),
                 .mem_write_ready(data_mem_write_ready[i]),
                 .rs(rs[i]),
                 .rt(rt[i]),
-                .lsu_state(lsu_state_A[i]), // Connect to Shadow State A
-                .lsu_out(lsu_out_A[i])
+                .lsu_state(lsu_state[i]),
+                .lsu_out(lsu_out[i])
             );
 
-            // Intermediate wires to hold outputs from LSU B
-            wire lsu_read_valid_B, lsu_write_valid_B;
-            wire [7:0] lsu_read_address_B, lsu_write_address_B, lsu_write_data_B;
-
-            lsu lsu_instance_B (
-                .clk(clk),
-                .reset(reset),
-                .enable(i < thread_count),
-                // Only active if scheduler says Context 1
-                .core_state( (scheduler_instance.active_context == 1) ? core_state : 3'b000 ),
-                .decoded_mem_read_enable(decoded_mem_read_enable),
-                .decoded_mem_write_enable(decoded_mem_write_enable),
-                .mem_read_valid(lsu_read_valid_B),
-                .mem_read_address(lsu_read_address_B),
-                .mem_read_ready(data_mem_read_ready[i]), // Shared Ready
-                .mem_read_data(data_mem_read_data[i]),   // Shared Data
-                .mem_write_valid(lsu_write_valid_B),
-                .mem_write_address(lsu_write_address_B),
-                .mem_write_data(lsu_write_data_B),
-                .mem_write_ready(data_mem_write_ready[i]),
-                .rs(rs[i]),
-                .rt(rt[i]),
-                .lsu_state(lsu_state_B[i]), // Connect to Shadow State B
-                .lsu_out(lsu_out_B[i])
-            );
-
-            // ---------------------------------------------------------
-            // BANKED REGISTER FILE
-            // ---------------------------------------------------------
+            // Register File
             registers #(
                 .THREADS_PER_BLOCK(THREADS_PER_BLOCK),
                 .THREAD_ID(i),
-                .DATA_BITS(DATA_MEM_DATA_BITS)
+                .DATA_BITS(DATA_MEM_DATA_BITS),
             ) register_instance (
                 .clk(clk),
                 .reset(reset),
                 .enable(i < thread_count),
-                // NEW INPUTS
-                .active_context(scheduler_instance.active_context),
                 .block_id(block_id),
                 .core_state(core_state),
                 .decoded_reg_write_enable(decoded_reg_write_enable),
@@ -269,21 +185,19 @@ module core #(
                 .decoded_rt_address(decoded_rt_address),
                 .decoded_immediate(decoded_immediate),
                 .alu_out(alu_out[i]),
-                .lsu_out(lsu_out_muxed), // Feed MUXED LSU output
+                .lsu_out(lsu_out[i]),
                 .rs(rs[i]),
                 .rt(rt[i])
             );
 
-            // ---------------------------------------------------------
-            // DUAL PCs
-            // ---------------------------------------------------------
+            // Program Counter
             pc #(
                 .DATA_MEM_DATA_BITS(DATA_MEM_DATA_BITS),
                 .PROGRAM_MEM_ADDR_BITS(PROGRAM_MEM_ADDR_BITS)
-            ) pc_instance_A (
+            ) pc_instance (
                 .clk(clk),
                 .reset(reset),
-                .enable(scheduler_instance.active_context == 0 && i < thread_count),
+                .enable(i < thread_count),
                 .core_state(core_state),
                 .decoded_nzp(decoded_nzp),
                 .decoded_immediate(decoded_immediate),
@@ -291,24 +205,7 @@ module core #(
                 .decoded_pc_mux(decoded_pc_mux),
                 .alu_out(alu_out[i]),
                 .current_pc(current_pc),
-                .next_pc(next_pc_A[i]) // Output to A
-            );
-
-            pc #(
-                .DATA_MEM_DATA_BITS(DATA_MEM_DATA_BITS),
-                .PROGRAM_MEM_ADDR_BITS(PROGRAM_MEM_ADDR_BITS)
-            ) pc_instance_B (
-                .clk(clk),
-                .reset(reset),
-                .enable(scheduler_instance.active_context == 1 && i < thread_count),
-                .core_state(core_state),
-                .decoded_nzp(decoded_nzp),
-                .decoded_immediate(decoded_immediate),
-                .decoded_nzp_write_enable(decoded_nzp_write_enable),
-                .decoded_pc_mux(decoded_pc_mux),
-                .alu_out(alu_out[i]),
-                .current_pc(current_pc),
-                .next_pc(next_pc_B[i]) // Output to B
+                .next_pc(next_pc[i])
             );
         end
     endgenerate
